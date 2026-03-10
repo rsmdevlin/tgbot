@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 telethon
 PySocks
+psycopg2-binary
