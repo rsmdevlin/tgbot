@@ -151,7 +151,7 @@ def ask_agent(agent, history, user_message, context_info=""):
         msgs.append({"role":m["role"],"content":m["content"]})
     msgs.append({"role":"user","content":user_message})
     resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile", messages=msgs, max_tokens=1200, temperature=0.7)
+        model="llama-3.3-70b-versatile", messages=msgs, max_tokens=8000, temperature=0.7)
     return resp.choices[0].message.content
 
 def extract_code(text):
