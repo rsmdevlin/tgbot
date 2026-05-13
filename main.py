@@ -29,6 +29,63 @@ TASKS_FILE = "/tmp/tasks.json"
 # ============================================================
 _PATCHES = {}  # user_id -> {"code": str, "agent": str}
 
+# ============================================================
+# УМНОЕ ПРИМЕНЕНИЕ ПАТЧЕЙ — без перезаписи всего файла
+# ============================================================
+def apply_smart_patch(original_code: str, patch_text: str):
+    """Применяет патч точечно, не перезаписывая весь файл"""
+    import re
+    result = original_code
+    changes = []
+
+    # ФОРМАТ 1: ADD_FUNCTION + REGISTER
+    add_match = re.search(r"===ADD_FUNCTION===\n(.*?)===END===", patch_text, re.DOTALL)
+    reg_match  = re.search(r"===REGISTER===\n(.*?)===END===",    patch_text, re.DOTALL)
+    if add_match:
+        new_func = add_match.group(1).strip()
+        if "\ndef main():" in result:
+            result = result.replace("\ndef main():", f"\n{new_func}\n\ndef main():")
+            changes.append("добавлена функция")
+    if reg_match:
+        reg_line = reg_match.group(1).strip()
+        if "    app.run_polling(" in result:
+            result = result.replace("    app.run_polling(", f"    {reg_line}\n    app.run_polling(")
+            changes.append("зарегистрирован хендлер")
+
+    # ФОРМАТ 2: REPLACE...WITH
+    for m in re.finditer(r"===REPLACE===\n(.*?)===WITH===\n(.*?)===END===", patch_text, re.DOTALL):
+        old_code = m.group(1).strip()
+        new_code = m.group(2).strip()
+        if old_code in result:
+            result = result.replace(old_code, new_code, 1)
+            changes.append("заменён блок")
+        else:
+            changes.append("⚠️ блок для замены не найден")
+
+    # ФОРМАТ 3: INSERT_AFTER
+    for m in re.finditer(r"===INSERT_AFTER===\n(.*?)===CODE===\n(.*?)===END===", patch_text, re.DOTALL):
+        pattern = m.group(1).strip()
+        code    = m.group(2).strip()
+        if pattern in result:
+            result = result.replace(pattern, pattern + "\n" + code, 1)
+            changes.append("вставлен код")
+
+    # ФОРМАТ 4: полный файл в ```python (старый способ, как запасной)
+    full_match = re.search(r"```(?:python)?\n(.*?)```", patch_text, re.DOTALL)
+    if full_match and not changes:
+        full_code = full_match.group(1).strip()
+        # Проверяем что файл не меньше 80% от оригинала
+        if len(full_code.splitlines()) >= len(original_code.splitlines()) * 0.8:
+            result = full_code
+            changes.append("полная замена файла")
+        else:
+            changes.append("⚠️ файл слишком короткий, патч отклонён")
+            return original_code, "❌ Патч отклонён — файл короче оригинала на 20%+"
+
+    return result, "; ".join(changes) if changes else "нет изменений"
+
+
+
 def save_patch(user_id: int, code: str, agent_name: str):
     _PATCHES[user_id] = {"code": code, "agent": agent_name}
 
@@ -136,8 +193,23 @@ def ask_agent(agent, history, user_message, context_info=""):
     t = (agent.get("name","") + agent.get("role","")).lower()
     eng = any(w in t for w in ["инженер","разработ","програм","engineer","developer"])
     eng_extra = (
-        "\n\nКогда пишешь исправление кода — давай ПОЛНЫЙ файл целиком в блоке ```python. "
-        "Не сокращай, не пиши '# остальной код без изменений'. Только полный файл.\n"
+        "\n\nТЫ ИНЖЕНЕР. Используй специальный формат патча — НЕ пиши полный файл целиком.\n"
+        "Используй ОДИН из форматов:\n\n"
+        "ФОРМАТ 1 — добавить новую команду/функцию:\n"
+        "===ADD_FUNCTION===\n"
+        "async def my_command(update, context):\n"
+        "    await update.message.reply_text(\'Ответ\')\n"
+        "===END===\n"
+        "===REGISTER===\n"
+        "app.add_handler(CommandHandler(\'cmd\', my_command))\n"
+        "===END===\n\n"
+        "ФОРМАТ 2 — заменить существующий код:\n"
+        "===REPLACE===\n"
+        "старый код который нужно заменить (скопируй точно)\n"
+        "===WITH===\n"
+        "новый исправленный код\n"
+        "===END===\n\n"
+        "ВАЖНО: пиши ТОЛЬКО патч в одном из этих форматов. Никакого полного файла.\n"
     ) if eng else ""
     system = (
         f'Ты — AI-агент "{agent["name"]}".\n'
@@ -398,9 +470,19 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not GITHUB_TOKEN or not GITHUB_REPO:
             await q.edit_message_text("❌ GitHub не настроен.", reply_markup=back_kb()); return
 
-        await q.edit_message_text("⏳ Коммичу в GitHub...")
-        commit_msg = f"fix: auto-patch by {agent_name} via AI Office"
-        result = await github_commit_file(patch_code, commit_msg)
+        await q.edit_message_text("⏳ Применяю патч...")
+        # Читаем текущий файл и применяем умный патч
+        current = await github_get_file()
+        if "error" not in current:
+            final_code, change_desc = apply_smart_patch(current["content"], patch_code)
+            if "❌" in change_desc:
+                await q.edit_message_text(f"❌ {change_desc}", reply_markup=back_kb())
+                return
+        else:
+            final_code = patch_code
+            change_desc = "полная замена"
+        commit_msg = f"fix: {change_desc} by {agent_name} via AI Office"
+        result = await github_commit_file(final_code, commit_msg)
 
         if result.get("success"):
             delete_patch(user_id)
@@ -489,16 +571,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ctx = f"Коллеги: {', '.join(db['agents'].keys())}.\n"
 
             if is_eng(agent):
-                await update.message.reply_text("📄 Читаю текущий код...")
+                await update.message.reply_text("📄 Читаю структуру кода...")
                 file_data = await github_get_file()
                 if "error" not in file_data:
                     full_code = file_data['content']
+                    lines = full_code.splitlines()
+                    # Передаём только структуру + первые/последние строки для контекста
+                    structure = "\n".join(
+                        l for l in lines 
+                        if l.strip().startswith(("def ", "async def ", "class ", "app.add_handler", "elif d ==", "elif d.startswith"))
+                    )
                     ctx += (
-                        f"\n⚠️ КРИТИЧЕСКИ ВАЖНО: Ты ОБЯЗАН вернуть ПОЛНЫЙ файл целиком в блоке ```python.\n"
-                        f"ЗАПРЕЩЕНО писать '# остальной код без изменений' или сокращать файл.\n"
-                        f"ЗАПРЕЩЕНО возвращать файл короче {len(full_code.splitlines()) if False else 'оригинала'} строк.\n"
-                        f"Только добавляй своё изменение в нужное место, всё остальное оставляй как есть.\n\n"
-                        f"ПОЛНЫЙ ТЕКУЩИЙ КОД:\n```python\n{full_code}\n```\n"
+                        f"\nФайл: {len(lines)} строк.\n"
+                        f"\nСТРУКТУРА ФАЙЛА (функции и хендлеры):\n```\n{structure}\n```\n"
+                        f"\nПервые 50 строк (импорты и конфиг):\n```python\n{'\n'.join(lines[:50])}\n```\n"
+                        f"\nПоследние 50 строк (регистрация хендлеров):\n```python\n{'\n'.join(lines[-50:])}\n```\n"
                     )
 
             reply = ask_agent(agent, history, msg, ctx)
