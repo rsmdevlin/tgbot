@@ -1,4 +1,2 @@
-pyTelegramBotAPI
-telethon
-PySocks
-psycopg2-binary
+python-telegram-bot==20.7
+google-generativeai==0.4.0
