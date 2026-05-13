@@ -1,403 +1,648 @@
 import json
 import os
-from groq import Groq
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
+from groq import Groq
 
-# =============================================
-# ТОКЕНЫ — переменные окружения Railway
-# =============================================
+# ============================================================
+# КОНФИГ — заполни в Railway Variables
+# ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # вставь свой Groq токен сюда или в Railway Variables
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+# ID группового чата (после добавления бота в группу напиши /id в группе)
+GROUP_CHAT_ID  = int(os.environ.get("GROUP_CHAT_ID", "0"))
+# Твой личный Telegram user_id (узнай у @userinfobot)
+OWNER_ID       = int(os.environ.get("OWNER_ID", "6091955295"))
 
-AGENTS_FILE = "/tmp/agents.json"
+# ============================================================
+# ХРАНИЛИЩЕ
+# ============================================================
+DB_FILE    = "/tmp/office.json"
+TASKS_FILE = "/tmp/tasks.json"
 
-def load_agents():
-    if os.path.exists(AGENTS_FILE):
-        with open(AGENTS_FILE, "r", encoding="utf-8") as f:
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {}
+    return {"agents": {}}
 
-def save_agents(agents):
-    with open(AGENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(agents, f, ensure_ascii=False, indent=2)
+def save_db(db):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
 
-(WAITING_AGENT_NAME, WAITING_AGENT_TASK,
- WAITING_MESSAGE, WAITING_EDIT_NAME, WAITING_EDIT_TASK) = range(5)
+def load_tasks():
+    if os.path.exists(TASKS_FILE):
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить агента", callback_data="add_agent")],
-        [InlineKeyboardButton("🤖 Мои агенты", callback_data="list_agents")],
-        [InlineKeyboardButton("💬 Поговорить с агентом", callback_data="chat_select")],
-        [InlineKeyboardButton("❌ Удалить агента", callback_data="delete_select")],
-    ])
+def save_tasks(tasks):
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
 
-def agents_list_keyboard(agents, prefix="chat"):
-    buttons = []
-    for name in agents:
-        emoji = agents[name].get("emoji", "🤖")
-        buttons.append([InlineKeyboardButton(f"{emoji} {name}", callback_data=f"{prefix}:{name}")])
-    buttons.append([InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(buttons)
+def add_task(from_name, to_name, description, status="🔄 В работе"):
+    tasks = load_tasks()
+    task = {
+        "id": len(tasks) + 1,
+        "from": from_name,
+        "to": to_name,
+        "description": description,
+        "status": status,
+        "created_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "updated_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    }
+    tasks.append(task)
+    save_tasks(tasks)
+    return task
 
-def back_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]])
+def update_task_status(task_id, status):
+    tasks = load_tasks()
+    for t in tasks:
+        if t["id"] == task_id:
+            t["status"] = status
+            t["updated_at"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    save_tasks(tasks)
 
-def pick_emoji(name, task):
-    text = (name + task).lower()
-    if any(w in text for w in ["код", "программ", "python", "developer", "разработ"]):
-        return "👨‍💻"
-    elif any(w in text for w in ["бизнес", "менеджер", "стратег", "продаж", "маркет"]):
-        return "💼"
-    elif any(w in text for w in ["копирайт", "текст", "писател", "контент", "автор"]):
-        return "✍️"
-    elif any(w in text for w in ["учител", "репетитор", "обучен"]):
-        return "👨‍🏫"
-    elif any(w in text for w in ["психолог", "коуч", "советник"]):
-        return "🧠"
-    elif any(w in text for w in ["дизайн", "творч", "художник"]):
-        return "🎨"
-    elif any(w in text for w in ["аналит", "данн", "исследован"]):
-        return "🔬"
-    elif any(w in text for w in ["юрист", "право", "закон"]):
-        return "⚖️"
-    elif any(w in text for w in ["финанс", "инвест", "деньг"]):
-        return "💰"
-    else:
-        return "🤖"
-
-def ask_groq(system_prompt: str, history: list, user_message: str) -> str:
+# ============================================================
+# GROQ
+# ============================================================
+def ask_agent(agent: dict, history: list, user_message: str, context_info: str = "") -> str:
     client = Groq(api_key=GROQ_API_KEY)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    for m in history[-10:]:
+    system = (
+        f'Ты — AI-агент по имени "{agent["name"]}".\n\n'
+        f'Твоя роль: {agent["role"]}\n\n'
+        f'Зоны ответственности: {agent.get("responsibilities", "")}\n\n'
+        f'{context_info}'
+        f'Отвечай чётко, по делу, по-русски. Ты часть AI-офиса.'
+    )
+    messages = [{"role": "system", "content": system}]
+    for m in history[-8:]:
         messages.append({"role": m["role"], "content": m["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # бесплатная мощная модель
+    resp = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=messages,
-        max_tokens=1024,
+        max_tokens=800,
         temperature=0.7,
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content
 
-async def send_main_menu(update, context):
-    agents = load_agents()
-    count = len(agents)
-    user = update.effective_user
+# ============================================================
+# СОСТОЯНИЯ
+# ============================================================
+(WAIT_AGENT_NAME, WAIT_AGENT_ROLE, WAIT_AGENT_RESP,
+ WAIT_CHAT_MSG, WAIT_TASK_DESC, WAIT_TASK_TO,
+ WAIT_EDIT_ROLE, WAIT_EDIT_RESP) = range(8)
+
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
+def main_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Мои агенты", callback_data="agents"),
+         InlineKeyboardButton("➕ Добавить агента", callback_data="add_agent")],
+        [InlineKeyboardButton("📋 Задачник", callback_data="tasks"),
+         InlineKeyboardButton("💬 Чат с агентом", callback_data="chat_select")],
+        [InlineKeyboardButton("📢 Написать всей команде", callback_data="broadcast")],
+    ])
+
+def agents_kb(mode="view"):
+    db = load_db()
+    agents = db.get("agents", {})
+    buttons = []
+    for name in agents:
+        emoji = agents[name].get("emoji", "🤖")
+        buttons.append([InlineKeyboardButton(f"{emoji} {name}", callback_data=f"{mode}:{name}")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="main")])
+    return InlineKeyboardMarkup(buttons)
+
+def back_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Главное меню", callback_data="main")]])
+
+def agent_actions_kb(name):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Написать", callback_data=f"chat:{name}"),
+         InlineKeyboardButton("📋 Дать задачу", callback_data=f"newtask:{name}")],
+        [InlineKeyboardButton("✏️ Изменить роль", callback_data=f"editrole:{name}"),
+         InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{name}")],
+        [InlineKeyboardButton("🔙 Все агенты", callback_data="agents")],
+    ])
+
+def pick_emoji(name, role):
+    t = (name + role).lower()
+    if any(w in t for w in ["програм", "код", "developer", "python", "инженер"]): return "👨‍💻"
+    if any(w in t for w in ["менеджер", "управл", "директор", "руководит"]): return "👔"
+    if any(w in t for w in ["маркет", "реклам", "smm", "контент"]): return "📣"
+    if any(w in t for w in ["дизайн", "творч", "художник"]): return "🎨"
+    if any(w in t for w in ["аналит", "данн", "исследован"]): return "🔬"
+    if any(w in t for w in ["юрист", "право", "закон"]): return "⚖️"
+    if any(w in t for w in ["финанс", "бухгалт", "деньг"]): return "💰"
+    if any(w in t for w in ["копирайт", "писател", "текст"]): return "✍️"
+    if any(w in t for w in ["ассистент", "помощник", "секретар"]): return "🧑‍💼"
+    return "🤖"
+
+# ============================================================
+# ГЛАВНОЕ МЕНЮ
+# ============================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    count = len(db.get("agents", {}))
+    tasks = load_tasks()
+    active = sum(1 for t in tasks if "✅" not in t["status"])
     text = (
-        f"👋 Привет, *{user.first_name}*!\n\n"
-        f"🧠 *AgentHub* — твой центр ИИ-агентов\n\n"
-        f"📊 Агентов: *{count}*\n\n"
-        f"Выбери действие:"
+        f"🏢 *AI-Офис*\n\n"
+        f"👥 Агентов в команде: *{count}*\n"
+        f"📋 Активных задач: *{active}*\n\n"
+        f"Управляй своей AI-командой:"
     )
     if update.message:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
+    else:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_kb())
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_main_menu(update, context)
+async def get_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /id — узнать ID чата"""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"ID этого чата: `{chat_id}`", parse_mode="Markdown")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+# ============================================================
+# КНОПКИ
+# ============================================================
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = q.data
 
-    if data == "main_menu":
-        await send_main_menu(update, context)
+    # --- ГЛАВНОЕ МЕНЮ ---
+    if d == "main":
+        await start(update, context)
 
-    elif data == "add_agent":
-        await query.edit_message_text(
-            "✨ *Создание агента*\n\nКак назвать агента?\nПример: _Программист_, _Копирайтер_, _Бизнес-советник_",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard()
-        )
-        return WAITING_AGENT_NAME
-
-    elif data == "list_agents":
-        agents = load_agents()
+    # --- СПИСОК АГЕНТОВ ---
+    elif d == "agents":
+        db = load_db()
+        agents = db.get("agents", {})
         if not agents:
-            await query.edit_message_text("😕 Агентов нет. Создай первого!", reply_markup=main_menu_keyboard())
+            await q.edit_message_text("😕 Агентов пока нет. Добавь первого!", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить агента", callback_data="add_agent")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="main")]
+            ]))
             return
-        text = "🤖 *Твои агенты:*\n\n"
-        for name, d in agents.items():
-            emoji = d.get("emoji", "🤖")
-            preview = d["task"][:60] + "..." if len(d["task"]) > 60 else d["task"]
-            text += f"{emoji} *{name}*\n_{preview}_\n\n"
+        text = "👥 *Команда AI-агентов:*\n\n"
+        for name, a in agents.items():
+            emoji = a.get("emoji", "🤖")
+            text += f"{emoji} *{name}* — {a['role'][:50]}\n"
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=agents_kb("view"))
+
+    # --- ПРОСМОТР АГЕНТА ---
+    elif d.startswith("view:"):
+        name = d.split(":", 1)[1]
+        db = load_db()
+        a = db["agents"].get(name)
+        if not a:
+            await q.edit_message_text("❌ Агент не найден.", reply_markup=back_kb())
+            return
+        emoji = a.get("emoji", "🤖")
+        tasks = load_tasks()
+        my_tasks = [t for t in tasks if t["to"] == name]
+        active = sum(1 for t in my_tasks if "✅" not in t["status"])
+        text = (
+            f"{emoji} *{name}*\n\n"
+            f"📌 *Роль:* {a['role']}\n\n"
+            f"🎯 *Зоны ответственности:*\n{a.get('responsibilities', '—')}\n\n"
+            f"📋 Задач всего: {len(my_tasks)} | Активных: {active}"
+        )
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=agent_actions_kb(name))
+
+    # --- ДОБАВИТЬ АГЕНТА ---
+    elif d == "add_agent":
+        await q.edit_message_text(
+            "➕ *Новый агент*\n\nКак зовут агента?\nПример: _Алиса_, _Макс_, _Инженер_",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return WAIT_AGENT_NAME
+
+    # --- УДАЛИТЬ АГЕНТА ---
+    elif d.startswith("del:"):
+        name = d.split(":", 1)[1]
+        db = load_db()
+        if name in db["agents"]:
+            del db["agents"][name]
+            save_db(db)
+        await q.edit_message_text(f"🗑 Агент *{name}* удалён.", parse_mode="Markdown", reply_markup=main_kb())
+
+    # --- ИЗМЕНИТЬ РОЛЬ ---
+    elif d.startswith("editrole:"):
+        name = d.split(":", 1)[1]
+        context.user_data["editing_agent"] = name
+        await q.edit_message_text(
+            f"✏️ Введи новую роль для *{name}*:",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return WAIT_EDIT_ROLE
+
+    # --- ЗАДАЧНИК ---
+    elif d == "tasks":
+        tasks = load_tasks()
+        if not tasks:
+            await q.edit_message_text("📋 Задач пока нет.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Создать задачу", callback_data="newtask")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="main")]
+            ]))
+            return
+        text = "📋 *Задачник:*\n\n"
+        for t in tasks[-10:][::-1]:
+            text += f"{t['status']} *#{t['id']}* {t['description'][:40]}\n"
+            text += f"   👤 {t['from']} → {t['to']} | {t['created_at']}\n\n"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Редактировать агента", callback_data="edit_select")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+            [InlineKeyboardButton("➕ Новая задача", callback_data="newtask"),
+             InlineKeyboardButton("✅ Закрыть задачу", callback_data="close_task")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="main")]
         ])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
-    elif data == "chat_select":
-        agents = load_agents()
-        if not agents:
-            await query.edit_message_text("😕 Нет агентов. Создай первого!", reply_markup=main_menu_keyboard())
+    # --- НОВАЯ ЗАДАЧА (без агента) ---
+    elif d == "newtask":
+        db = load_db()
+        if not db.get("agents"):
+            await q.edit_message_text("😕 Нет агентов. Сначала добавь агента!", reply_markup=back_kb())
             return
-        await query.edit_message_text(
-            "💬 *Выбери агента:*",
+        await q.edit_message_text(
+            "📋 *Новая задача*\n\nКому назначить?",
             parse_mode="Markdown",
-            reply_markup=agents_list_keyboard(agents, "chat")
+            reply_markup=agents_kb("assignto")
         )
 
-    elif data.startswith("chat:"):
-        agent_name = data.split(":", 1)[1]
-        agents = load_agents()
-        agent = agents.get(agent_name)
-        if not agent:
-            await query.edit_message_text("❌ Агент не найден.", reply_markup=back_keyboard())
+    # --- НОВАЯ ЗАДАЧА (с агентом) ---
+    elif d.startswith("newtask:"):
+        name = d.split(":", 1)[1]
+        context.user_data["task_to"] = name
+        await q.edit_message_text(
+            f"📋 Задача для *{name}*\n\nОпиши задачу:",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return WAIT_TASK_DESC
+
+    # --- НАЗНАЧИТЬ ЗАДАЧУ (выбор агента) ---
+    elif d.startswith("assignto:"):
+        name = d.split(":", 1)[1]
+        context.user_data["task_to"] = name
+        await q.edit_message_text(
+            f"📋 Задача для *{name}*\n\nОпиши задачу:",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        return WAIT_TASK_DESC
+
+    # --- ЗАКРЫТЬ ЗАДАЧУ ---
+    elif d == "close_task":
+        await q.edit_message_text(
+            "✅ Введи *номер задачи* для закрытия (например: 3):",
+            parse_mode="Markdown", reply_markup=back_kb()
+        )
+        context.user_data["action"] = "close_task"
+
+    # --- ЧАТ: выбор агента ---
+    elif d == "chat_select":
+        db = load_db()
+        if not db.get("agents"):
+            await q.edit_message_text("😕 Нет агентов!", reply_markup=back_kb())
             return
-        context.user_data["active_agent"] = agent_name
+        await q.edit_message_text(
+            "💬 *С кем поговорить?*",
+            parse_mode="Markdown",
+            reply_markup=agents_kb("chat")
+        )
+
+    # --- ЧАТ: начало ---
+    elif d.startswith("chat:"):
+        name = d.split(":", 1)[1]
+        db = load_db()
+        agent = db["agents"].get(name)
+        if not agent:
+            await q.edit_message_text("❌ Агент не найден.", reply_markup=back_kb())
+            return
+        context.user_data["chat_agent"] = name
         context.user_data["chat_history"] = []
         emoji = agent.get("emoji", "🤖")
-        await query.edit_message_text(
-            f"{emoji} *{agent_name}* готов!\n\n"
-            f"_{agent['task'][:120]}_\n\n"
-            f"Напиши сообщение. /start — выход в меню.",
+        await q.edit_message_text(
+            f"{emoji} *{name}* на связи!\n\n_{agent['role'][:100]}_\n\nПиши. /start — выход.",
             parse_mode="Markdown"
         )
-        return WAITING_MESSAGE
+        return WAIT_CHAT_MSG
 
-    elif data == "delete_select":
-        agents = load_agents()
-        if not agents:
-            await query.edit_message_text("😕 Нет агентов.", reply_markup=main_menu_keyboard())
+    # --- НАПИСАТЬ ВСЕЙ КОМАНДЕ ---
+    elif d == "broadcast":
+        db = load_db()
+        if not db.get("agents"):
+            await q.edit_message_text("😕 Нет агентов!", reply_markup=back_kb())
             return
-        await query.edit_message_text(
-            "❌ *Выбери агента для удаления:*",
-            parse_mode="Markdown",
-            reply_markup=agents_list_keyboard(agents, "delete")
+        await q.edit_message_text(
+            "📢 *Сообщение всей команде*\n\nВведи сообщение — все агенты его увидят и ответят:",
+            parse_mode="Markdown", reply_markup=back_kb()
         )
+        context.user_data["action"] = "broadcast"
 
-    elif data.startswith("delete:"):
-        agent_name = data.split(":", 1)[1]
-        agents = load_agents()
-        if agent_name in agents:
-            del agents[agent_name]
-            save_agents(agents)
-            await query.edit_message_text(
-                f"✅ Агент *{agent_name}* удалён.",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard()
-            )
-
-    elif data == "edit_select":
-        agents = load_agents()
-        if not agents:
-            await query.edit_message_text("Нет агентов.", reply_markup=main_menu_keyboard())
-            return
-        await query.edit_message_text(
-            "✏️ *Выбери агента:*",
-            parse_mode="Markdown",
-            reply_markup=agents_list_keyboard(agents, "edit")
-        )
-
-    elif data.startswith("edit:"):
-        agent_name = data.split(":", 1)[1]
-        agents = load_agents()
-        agent = agents.get(agent_name)
-        emoji = agent.get("emoji", "🤖")
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Изменить имя", callback_data=f"editname:{agent_name}")],
-            [InlineKeyboardButton("📋 Изменить задачу", callback_data=f"edittask:{agent_name}")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="list_agents")]
-        ])
-        await query.edit_message_text(
-            f"{emoji} *{agent_name}*\n\n_{agent['task']}_",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-    elif data.startswith("editname:"):
-        agent_name = data.split(":", 1)[1]
-        context.user_data["editing_agent"] = agent_name
-        await query.edit_message_text(
-            f"✏️ Введи новое имя для *{agent_name}*:",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard()
-        )
-        return WAITING_EDIT_NAME
-
-    elif data.startswith("edittask:"):
-        agent_name = data.split(":", 1)[1]
-        context.user_data["editing_agent"] = agent_name
-        await query.edit_message_text(
-            f"📋 Введи новую задачу для *{agent_name}*:",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard()
-        )
-        return WAITING_EDIT_TASK
-
-async def receive_agent_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()[:50]
-    context.user_data["new_agent_name"] = name
+# ============================================================
+# CONVERSATION: Добавление агента
+# ============================================================
+async def recv_agent_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_name"] = update.message.text.strip()[:50]
     await update.message.reply_text(
-        f"👍 Имя: *{name}*\n\n"
-        f"Теперь опиши его задачу и роль:\n\n"
-        f"Пример: _Ты опытный Python разработчик. Помогаешь с кодом, находишь баги, пишешь чистые решения._",
+        f"👍 Имя: *{context.user_data['new_name']}*\n\nОпиши его роль:",
         parse_mode="Markdown"
     )
-    return WAITING_AGENT_TASK
+    return WAIT_AGENT_ROLE
 
-async def receive_agent_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = update.message.text.strip()
-    name = context.user_data.get("new_agent_name", "Агент")
-    emoji = pick_emoji(name, task)
-    agents = load_agents()
-    agents[name] = {"task": task, "emoji": emoji}
-    save_agents(agents)
+async def recv_agent_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_role"] = update.message.text.strip()
     await update.message.reply_text(
-        f"✅ *Агент создан!*\n\n{emoji} *{name}*\n_{task[:150]}_",
+        "🎯 Опиши зоны ответственности агента\n_(или напиши 'пропустить')_:",
+        parse_mode="Markdown"
+    )
+    return WAIT_AGENT_RESP
+
+async def recv_agent_resp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    resp = update.message.text.strip()
+    if resp.lower() == "пропустить":
+        resp = ""
+    name = context.user_data["new_name"]
+    role = context.user_data["new_role"]
+    emoji = pick_emoji(name, role)
+    db = load_db()
+    db["agents"][name] = {"name": name, "role": role, "responsibilities": resp, "emoji": emoji}
+    save_db(db)
+
+    # Уведомление в группу если настроена
+    if GROUP_CHAT_ID:
+        try:
+            bot = context.bot
+            await bot.send_message(
+                GROUP_CHAT_ID,
+                f"👋 В команду добавлен новый агент!\n\n{emoji} *{name}*\n📌 {role}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"✅ *{emoji} {name}* добавлен в команду!\n\n📌 {role}",
         parse_mode="Markdown",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_kb()
     )
     return ConversationHandler.END
 
-async def chat_with_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text.strip()
-    agent_name = context.user_data.get("active_agent")
-    if not agent_name:
-        await update.message.reply_text("❌ Выбери агента!", reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-
-    agents = load_agents()
-    agent = agents.get(agent_name)
+# ============================================================
+# CONVERSATION: Чат с агентом
+# ============================================================
+async def chat_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_msg = update.message.text.strip()
+    name = context.user_data.get("chat_agent")
+    db = load_db()
+    agent = db["agents"].get(name)
     if not agent:
-        await update.message.reply_text("❌ Агент не найден.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("❌ Агент не найден.", reply_markup=main_kb())
         return ConversationHandler.END
 
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
     try:
         history = context.user_data.get("chat_history", [])
-        system_prompt = (
-            f'Ты — ИИ-агент по имени "{agent_name}".\n\n'
-            f'{agent["task"]}\n\n'
-            f'Всегда отвечай на русском языке. Будь конкретным и полезным.'
-        )
+        # Контекст команды
+        all_agents = ", ".join(db["agents"].keys())
+        ctx = f"Ты работаешь в AI-офисе вместе с: {all_agents}.\n"
+        reply = ask_agent(agent, history, user_msg, ctx)
 
-        reply_text = ask_groq(system_prompt, history, user_message)
-
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": reply_text})
-        context.user_data["chat_history"] = history[-20:]
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": reply})
+        context.user_data["chat_history"] = history[-16:]
 
         emoji = agent.get("emoji", "🤖")
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Сменить агента", callback_data="chat_select"),
-             InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Создать задачу", callback_data=f"newtask:{name}"),
+             InlineKeyboardButton("🏠 Меню", callback_data="main")]
         ])
-
-        # Telegram не любит некоторые символы в Markdown — отправляем как обычный текст если ошибка
         try:
-            await update.message.reply_text(
-                f"{emoji} *{agent_name}:*\n\n{reply_text}",
-                parse_mode="Markdown",
-                reply_markup=keyboard
-            )
+            await update.message.reply_text(f"{emoji} *{name}:*\n\n{reply}", parse_mode="Markdown", reply_markup=kb)
         except Exception:
-            await update.message.reply_text(
-                f"{emoji} {agent_name}:\n\n{reply_text}",
-                reply_markup=keyboard
-            )
+            await update.message.reply_text(f"{emoji} {name}:\n\n{reply}", reply_markup=kb)
+
+        # Дублируем в группу если настроена
+        if GROUP_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    GROUP_CHAT_ID,
+                    f"💬 *{name}* ответил:\n_{reply[:300]}_",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
 
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: `{str(e)[:300]}`", parse_mode="Markdown")
+        await update.message.reply_text(f"⚠️ Ошибка: `{str(e)[:200]}`", parse_mode="Markdown")
 
-    return WAITING_MESSAGE
+    return WAIT_CHAT_MSG
 
-async def receive_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_name = update.message.text.strip()
-    old_name = context.user_data.get("editing_agent")
-    agents = load_agents()
-    if old_name in agents:
-        agents[new_name] = agents.pop(old_name)
-        save_agents(agents)
-        await update.message.reply_text(
-            f"✅ Переименован: *{old_name}* → *{new_name}*",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
+# ============================================================
+# CONVERSATION: Задача
+# ============================================================
+async def recv_task_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = update.message.text.strip()
+    to_name = context.user_data.get("task_to", "?")
+    db = load_db()
+    owner_name = update.effective_user.first_name or "Владелец"
+    task = add_task(owner_name, to_name, desc)
+
+    # Агент реагирует на задачу
+    agent = db["agents"].get(to_name)
+    reply_text = ""
+    if agent:
+        try:
+            reply_text = ask_agent(
+                agent, [], f"Тебе назначена задача: {desc}. Прими задачу и кратко скажи как будешь её выполнять."
+            )
+        except Exception:
+            reply_text = "Принял задачу, приступаю к выполнению."
+
+    emoji = agent.get("emoji", "🤖") if agent else "🤖"
+    text = (
+        f"✅ *Задача #{task['id']} создана*\n\n"
+        f"👤 Кому: *{to_name}*\n"
+        f"📝 {desc}\n\n"
+        f"{emoji} *{to_name}:* _{reply_text[:300]}_"
+    )
+
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
+    except Exception:
+        await update.message.reply_text(f"Задача #{task['id']} создана для {to_name}.\n{to_name}: {reply_text[:300]}", reply_markup=main_kb())
+
+    # В группу
+    if GROUP_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                GROUP_CHAT_ID,
+                f"📋 *Новая задача #{task['id']}*\n"
+                f"👤 {owner_name} → {emoji} {to_name}\n"
+                f"📝 {desc}\n\n"
+                f"{emoji} *{to_name}:* _{reply_text[:200]}_",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
     return ConversationHandler.END
 
-async def receive_edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_task = update.message.text.strip()
-    agent_name = context.user_data.get("editing_agent")
-    agents = load_agents()
-    if agent_name in agents:
-        agents[agent_name]["task"] = new_task
-        save_agents(agents)
-        await update.message.reply_text(
-            f"✅ Задача *{agent_name}* обновлена!",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
+# ============================================================
+# CONVERSATION: Редактирование роли
+# ============================================================
+async def recv_edit_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data.get("editing_agent")
+    new_role = update.message.text.strip()
+    db = load_db()
+    if name in db["agents"]:
+        db["agents"][name]["role"] = new_role
+        db["agents"][name]["emoji"] = pick_emoji(name, new_role)
+        save_db(db)
+    await update.message.reply_text(f"✅ Роль *{name}* обновлена!", parse_mode="Markdown", reply_markup=main_kb())
     return ConversationHandler.END
+
+# ============================================================
+# ТЕКСТОВЫЕ СООБЩЕНИЯ вне диалога (broadcast / close_task)
+# ============================================================
+async def free_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    action = context.user_data.get("action")
+
+    # Закрытие задачи
+    if action == "close_task":
+        context.user_data.pop("action", None)
+        try:
+            task_id = int(update.message.text.strip())
+            update_task_status(task_id, "✅ Выполнено")
+            await update.message.reply_text(f"✅ Задача #{task_id} закрыта!", reply_markup=main_kb())
+        except Exception:
+            await update.message.reply_text("❌ Введи число — номер задачи.", reply_markup=main_kb())
+        return
+
+    # Broadcast всем агентам
+    if action == "broadcast":
+        context.user_data.pop("action", None)
+        db = load_db()
+        agents = db.get("agents", {})
+        if not agents:
+            await update.message.reply_text("Нет агентов.", reply_markup=main_kb())
+            return
+
+        msg = update.message.text.strip()
+        await update.message.reply_text(f"📢 Отправляю сообщение команде...", reply_markup=main_kb())
+
+        # Каждый агент отвечает
+        for name, agent in agents.items():
+            await context.bot.send_chat_action(update.effective_chat.id, "typing")
+            try:
+                reply = ask_agent(agent, [], f"Владелец написал всей команде: {msg}. Ответь коротко от своего лица.")
+                emoji = agent.get("emoji", "🤖")
+                try:
+                    await update.message.reply_text(f"{emoji} *{name}:*\n{reply}", parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(f"{emoji} {name}:\n{reply}")
+
+                # В группу
+                if GROUP_CHAT_ID:
+                    try:
+                        await context.bot.send_message(
+                            GROUP_CHAT_ID,
+                            f"{emoji} *{name}:* {reply[:300]}",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ {name} не ответил: {str(e)[:100]}")
+        return
+
+    # Если ничего — показать меню
+    await start(update, context)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("Отменено.", reply_markup=main_kb())
     return ConversationHandler.END
 
+# ============================================================
+# ЗАПУСК
+# ============================================================
 def main():
-    print("🚀 AgentHub Bot (Groq) запускается...")
+    print("🏢 AI-Офис запускается...")
     if not TELEGRAM_TOKEN:
-        print("❌ Не задан TELEGRAM_TOKEN!")
-        return
+        print("❌ Нет TELEGRAM_TOKEN!"); return
     if not GROQ_API_KEY:
-        print("❌ Не задан GROQ_API_KEY!")
-        return
+        print("❌ Нет GROQ_API_KEY!"); return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    create_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^add_agent$")],
+    # Добавление агента
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button, pattern="^add_agent$")],
         states={
-            WAITING_AGENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_agent_name)],
-            WAITING_AGENT_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_agent_task)],
+            WAIT_AGENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_agent_name)],
+            WAIT_AGENT_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_agent_role)],
+            WAIT_AGENT_RESP: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_agent_resp)],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel)],
         per_user=True
     )
 
+    # Чат с агентом
     chat_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern="^chat:.+")],
+        entry_points=[CallbackQueryHandler(button, pattern="^chat:.+")],
         states={
-            WAITING_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, chat_with_agent),
-                CallbackQueryHandler(button_handler, pattern="^(chat:|chat_select|main_menu)"),
+            WAIT_CHAT_MSG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, chat_msg),
+                CallbackQueryHandler(button, pattern="^(main|newtask:|chat_select)"),
             ],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel)],
         per_user=True
     )
 
-    edit_conv = ConversationHandler(
+    # Задача
+    task_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(button_handler, pattern="^editname:.+"),
-            CallbackQueryHandler(button_handler, pattern="^edittask:.+"),
+            CallbackQueryHandler(button, pattern="^newtask:.+"),
+            CallbackQueryHandler(button, pattern="^assignto:.+"),
         ],
         states={
-            WAITING_EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edit_name)],
-            WAITING_EDIT_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edit_task)],
+            WAIT_TASK_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_task_desc)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+        per_user=True
+    )
+
+    # Редактирование роли
+    edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button, pattern="^editrole:.+")],
+        states={
+            WAIT_EDIT_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, recv_edit_role)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_user=True
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(create_conv)
+    app.add_handler(CommandHandler("id", get_group_id))
+    app.add_handler(add_conv)
     app.add_handler(chat_conv)
+    app.add_handler(task_conv)
     app.add_handler(edit_conv)
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
 
-    print("✅ Бот запущен на Groq (llama-3.3-70b)!")
+    print("✅ AI-Офис запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
