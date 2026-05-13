@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -8,9 +7,6 @@ from telegram.ext import (
 )
 import google.generativeai as genai
 
-# =============================================
-# ТОКЕНЫ — берутся из переменных окружения Railway
-# =============================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAhJSSYCwQEoB25QumQ6kdo7eZosxPaysw")
 
@@ -78,15 +74,15 @@ async def send_main_menu(update, context):
     count = len(agents)
     user = update.effective_user
     text = (
-        f"👋 Привет, *{user.first_name}*\\!\n\n"
-        f"🧠 *AgentHub* — твой центр управления ИИ\\-агентами\\.\n\n"
+        f"👋 Привет, *{user.first_name}*!\n\n"
+        f"🧠 *AgentHub* — твой центр ИИ-агентов\n\n"
         f"📊 Агентов: *{count}*\n\n"
         f"Выбери действие:"
     )
     if update.message:
-        await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_main_menu(update, context)
@@ -101,8 +97,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "add_agent":
         await query.edit_message_text(
-            "✨ *Создание агента*\n\nКак назвать агента?\nПример: _Программист_, _Копирайтер_, _Бизнес\\-советник_",
-            parse_mode="MarkdownV2",
+            "✨ *Создание агента*\n\nКак назвать агента?\nПример: _Программист_, _Копирайтер_, _Бизнес-советник_",
+            parse_mode="Markdown",
             reply_markup=back_keyboard()
         )
         return WAITING_AGENT_NAME
@@ -169,7 +165,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if agent_name in agents:
             del agents[agent_name]
             save_agents(agents)
-            await query.edit_message_text(f"✅ Агент *{agent_name}* удалён.", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            await query.edit_message_text(
+                f"✅ Агент *{agent_name}* удалён.",
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard()
+            )
 
     elif data == "edit_select":
         agents = load_agents()
@@ -201,13 +201,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("editname:"):
         agent_name = data.split(":", 1)[1]
         context.user_data["editing_agent"] = agent_name
-        await query.edit_message_text(f"✏️ Введи новое имя для *{agent_name}*:", parse_mode="Markdown", reply_markup=back_keyboard())
+        await query.edit_message_text(
+            f"✏️ Введи новое имя для *{agent_name}*:",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard()
+        )
         return WAITING_EDIT_NAME
 
     elif data.startswith("edittask:"):
         agent_name = data.split(":", 1)[1]
         context.user_data["editing_agent"] = agent_name
-        await query.edit_message_text(f"📋 Введи новую задачу для *{agent_name}*:", parse_mode="Markdown", reply_markup=back_keyboard())
+        await query.edit_message_text(
+            f"📋 Введи новую задачу для *{agent_name}*:",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard()
+        )
         return WAITING_EDIT_TASK
 
 async def receive_agent_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,10 +260,22 @@ async def chat_with_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         history = context.user_data.get("chat_history", [])
-        system_prompt = f'Ты — ИИ-агент "{agent_name}".\n\n{agent["task"]}\n\nОтвечай по-русски, будь конкретным и полезным.'
+        system_prompt = (
+            f'Ты — ИИ-агент по имени "{agent_name}".\n\n'
+            f'{agent["task"]}\n\n'
+            f'Отвечай по-русски, будь конкретным и полезным.'
+        )
 
-        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=system_prompt)
-        gemini_history = [{"role": m["role"], "parts": [m["content"]]} for m in history[-10:]]
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+
+        # Системный промпт передаём через первые сообщения истории
+        gemini_history = [
+            {"role": "user", "parts": [f"Запомни свою роль и придерживайся её всегда:\n\n{system_prompt}"]},
+            {"role": "model", "parts": ["Понял, запомнил свою роль. Готов работать!"]},
+        ]
+        for m in history[-10:]:
+            gemini_history.append({"role": m["role"], "parts": [m["content"]]})
+
         chat = model.start_chat(history=gemini_history)
         response = chat.send_message(user_message)
         reply_text = response.text
@@ -274,8 +294,12 @@ async def chat_with_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
+
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: `{str(e)[:200]}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"⚠️ Ошибка: `{str(e)[:300]}`",
+            parse_mode="Markdown"
+        )
 
     return WAITING_MESSAGE
 
@@ -286,7 +310,11 @@ async def receive_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old_name in agents:
         agents[new_name] = agents.pop(old_name)
         save_agents(agents)
-        await update.message.reply_text(f"✅ Переименован: *{old_name}* → *{new_name}*", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            f"✅ Переименован: *{old_name}* → *{new_name}*",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard()
+        )
     return ConversationHandler.END
 
 async def receive_edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -296,7 +324,11 @@ async def receive_edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if agent_name in agents:
         agents[agent_name]["task"] = new_task
         save_agents(agents)
-        await update.message.reply_text(f"✅ Задача *{agent_name}* обновлена!", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await update.message.reply_text(
+            f"✅ Задача *{agent_name}* обновлена!",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard()
+        )
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,7 +338,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🚀 AgentHub Bot запускается...")
     if not TELEGRAM_TOKEN:
-        print("❌ ОШИБКА: Не задан TELEGRAM_TOKEN!")
+        print("❌ ОШИБКА: Не задан TELEGRAM_TOKEN в переменных окружения!")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
