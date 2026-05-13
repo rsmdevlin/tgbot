@@ -1,16 +1,17 @@
 import json
 import os
+from groq import Groq
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
-import google.generativeai as genai
 
+# =============================================
+# ТОКЕНЫ — переменные окружения Railway
+# =============================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-genai.configure(api_key=GEMINI_API_KEY)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # вставь свой Groq токен сюда или в Railway Variables
 
 AGENTS_FILE = "/tmp/agents.json"
 
@@ -68,6 +69,22 @@ def pick_emoji(name, task):
         return "💰"
     else:
         return "🤖"
+
+def ask_groq(system_prompt: str, history: list, user_message: str) -> str:
+    client = Groq(api_key=GROQ_API_KEY)
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for m in history[-10:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",  # бесплатная мощная модель
+        messages=messages,
+        max_tokens=1024,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
 async def send_main_menu(update, context):
     agents = load_agents()
@@ -263,25 +280,13 @@ async def chat_with_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system_prompt = (
             f'Ты — ИИ-агент по имени "{agent_name}".\n\n'
             f'{agent["task"]}\n\n'
-            f'Отвечай по-русски, будь конкретным и полезным.'
+            f'Всегда отвечай на русском языке. Будь конкретным и полезным.'
         )
 
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
-
-        # Системный промпт передаём через первые сообщения истории
-        gemini_history = [
-            {"role": "user", "parts": [f"Запомни свою роль и придерживайся её всегда:\n\n{system_prompt}"]},
-            {"role": "model", "parts": ["Понял, запомнил свою роль. Готов работать!"]},
-        ]
-        for m in history[-10:]:
-            gemini_history.append({"role": m["role"], "parts": [m["content"]]})
-
-        chat = model.start_chat(history=gemini_history)
-        response = chat.send_message(user_message)
-        reply_text = response.text
+        reply_text = ask_groq(system_prompt, history, user_message)
 
         history.append({"role": "user", "content": user_message})
-        history.append({"role": "model", "content": reply_text})
+        history.append({"role": "assistant", "content": reply_text})
         context.user_data["chat_history"] = history[-20:]
 
         emoji = agent.get("emoji", "🤖")
@@ -289,17 +294,22 @@ async def chat_with_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔄 Сменить агента", callback_data="chat_select"),
              InlineKeyboardButton("🏠 Меню", callback_data="main_menu")]
         ])
-        await update.message.reply_text(
-            f"{emoji} *{agent_name}:*\n\n{reply_text}",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
+
+        # Telegram не любит некоторые символы в Markdown — отправляем как обычный текст если ошибка
+        try:
+            await update.message.reply_text(
+                f"{emoji} *{agent_name}:*\n\n{reply_text}",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+        except Exception:
+            await update.message.reply_text(
+                f"{emoji} {agent_name}:\n\n{reply_text}",
+                reply_markup=keyboard
+            )
 
     except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Ошибка: `{str(e)[:300]}`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"⚠️ Ошибка: `{str(e)[:300]}`", parse_mode="Markdown")
 
     return WAITING_MESSAGE
 
@@ -336,9 +346,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    print("🚀 AgentHub Bot запускается...")
+    print("🚀 AgentHub Bot (Groq) запускается...")
     if not TELEGRAM_TOKEN:
-        print("❌ ОШИБКА: Не задан TELEGRAM_TOKEN в переменных окружения!")
+        print("❌ Не задан TELEGRAM_TOKEN!")
+        return
+    if not GROQ_API_KEY:
+        print("❌ Не задан GROQ_API_KEY!")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -384,7 +397,7 @@ def main():
     app.add_handler(edit_conv)
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("✅ Бот запущен!")
+    print("✅ Бот запущен на Groq (llama-3.3-70b)!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
