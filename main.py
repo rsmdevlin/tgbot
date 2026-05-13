@@ -704,6 +704,7 @@ async def apply_patch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await q.edit_message_text(text, parse_mode="Markdown",
                                reply_markup=back_kb(), disable_web_page_preview=True)
+    return ConversationHandler.END
 
 # ============================================================
 # CONVERSATION: Задача
@@ -911,8 +912,9 @@ def main():
         entry_points=[CallbackQueryHandler(button, pattern="^chat:.+")],
         states={
             WAIT_CHAT_MSG: [
+                CallbackQueryHandler(apply_patch_handler, pattern="^apply_patch$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, chat_msg),
-                CallbackQueryHandler(button, pattern="^(main|newtask:|chat_select|apply_patch)"),
+                CallbackQueryHandler(button, pattern="^(main|newtask:|chat_select)"),
             ],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel)],
