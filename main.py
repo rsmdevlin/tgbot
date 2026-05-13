@@ -8,7 +8,7 @@ from telegram.ext import (
 import google.generativeai as genai
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDpg8K2RbbVuF7aUVeiakqmJ3abVHfygNI")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
